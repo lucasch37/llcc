@@ -17,6 +17,9 @@ pub enum ExternalDeclaration {
 pub enum TypeSpecifier {
     Void,
     Int,
+    Float,
+    Double,
+    Char,
 }
 
 #[derive(Debug, Clone)]
@@ -99,10 +102,18 @@ pub enum BlockItem {
 }
 
 #[derive(Debug, Clone)]
+pub enum FloatSuffix {
+    None,
+    Float,
+}
+
+#[derive(Debug, Clone)]
 pub enum Expr {
     Binary(Span, Box<Expr>, BinaryOp, Box<Expr>),
     Unary(Span, UnaryOp, Box<Expr>),
     IntLit(Span, String),
+    FloatLit(Span, String, FloatSuffix),
+    CharLit(Span, String),
     Identifier(Span, String),
     Assignment(Span, Box<Expr>, Box<Expr>),
 }
@@ -113,6 +124,8 @@ impl Expr {
             Expr::Binary(span, ..)
             | Expr::Unary(span, ..)
             | Expr::IntLit(span, ..)
+            | Expr::FloatLit(span, ..)
+            | Expr::CharLit(span, ..)
             | Expr::Assignment(span, ..)
             | Expr::Identifier(span, ..) => span,
         }

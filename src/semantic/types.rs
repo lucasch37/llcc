@@ -73,6 +73,14 @@ impl Type {
     pub fn is_function(&self) -> bool {
         matches!(self, Type::Function(_))
     }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Type::Invalid => 0,
+            Type::Primitive(p) => p.size(),
+            Type::Function(_) => 0,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -86,6 +94,21 @@ pub struct FunctionType {
 pub enum Primitive {
     Void,
     Int,
+    Float,
+    Double,
+    Char,
+}
+
+impl Primitive {
+    pub fn size(&self) -> usize {
+        match self {
+            Primitive::Void => 0,
+            Primitive::Char => 1,
+            Primitive::Int => 4,
+            Primitive::Float => 4,
+            Primitive::Double => 8,
+        }
+    }
 }
 
 use std::fmt;
@@ -147,6 +170,9 @@ impl fmt::Display for Primitive {
         match self {
             Primitive::Void => write!(f, "void"),
             Primitive::Int => write!(f, "int"),
+            Primitive::Char => write!(f, "char"),
+            Primitive::Float => write!(f, "float"),
+            Primitive::Double => write!(f, "double"),
         }
     }
 }

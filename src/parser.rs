@@ -8,19 +8,19 @@ use crate::{
 };
 
 pub struct Parser<'a> {
-    file: &'a str,
+    filename: &'a str,
     scanner: Lexer<'a>,
     current: Token,
     next: Token,
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(mut scanner: Lexer<'a>, file: &'a str) -> Self {
+    pub fn new(mut scanner: Lexer<'a>, filename: &'a str) -> Self {
         let current = scanner.next_token();
         let next = scanner.next_token();
 
         Self {
-            file,
+            filename,
             scanner,
             current,
             next,
@@ -38,7 +38,7 @@ impl<'a> Parser<'a> {
         } else {
             Err(Error::new(
                 self.scanner.source.to_string(),
-                self.file.to_string(),
+                self.filename.to_string(),
                 self.current.span,
                 ErrorKind::ExpectedFound(
                     kind.lexeme().to_string(),
@@ -166,7 +166,14 @@ impl<'a> Parser<'a> {
         let start = self.current.span.start;
         let mut type_specifiers = Vec::new();
 
-        while matches!(self.current.kind, TokenKind::Int | TokenKind::Void) {
+        while matches!(
+            self.current.kind,
+            TokenKind::Int
+                | TokenKind::Void
+                | TokenKind::Float
+                | TokenKind::Double
+                | TokenKind::Char
+        ) {
             type_specifiers.push(self.parse_type_specifier()?);
         }
 
@@ -182,11 +189,14 @@ impl<'a> Parser<'a> {
     fn parse_type_specifier(&mut self) -> Result<ast::TypeSpecifier> {
         let specifier = match self.current.kind {
             TokenKind::Int => ast::TypeSpecifier::Int,
+            TokenKind::Float => ast::TypeSpecifier::Float,
+            TokenKind::Double => ast::TypeSpecifier::Double,
+            TokenKind::Char => ast::TypeSpecifier::Char,
             TokenKind::Void => ast::TypeSpecifier::Void,
             _ => {
                 return Err(Error::new(
                     self.scanner.source.to_string(),
-                    self.file.to_string(),
+                    self.filename.to_string(),
                     self.current.span,
                     ErrorKind::ExpectedFound(
                         "type specifier".to_string(),
@@ -226,11 +236,14 @@ impl<'a> Parser<'a> {
         match self.current.kind {
             TokenKind::Return => self.parse_return_stmt(),
             TokenKind::LBrace => Ok(ast::Stmt::Compound(self.parse_compound_stmt()?)),
-            TokenKind::Identifier | TokenKind::IntLit => self.parse_expr_stmt(),
+            TokenKind::Identifier
+            | TokenKind::IntLit
+            | TokenKind::FloatLit
+            | TokenKind::CharLit => self.parse_expr_stmt(),
             _ => {
                 return Err(Error::new(
                     self.scanner.source.to_string(),
-                    self.file.to_string(),
+                    self.filename.to_string(),
                     self.current.span,
                     ErrorKind::ExpectedFound(
                         "statement".to_string(),
@@ -261,7 +274,14 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
 
         while self.current.kind != TokenKind::RBrace {
-            let item = if matches!(self.current.kind, TokenKind::Int | TokenKind::Void) {
+            let item = if matches!(
+                self.current.kind,
+                TokenKind::Int
+                    | TokenKind::Void
+                    | TokenKind::Float
+                    | TokenKind::Double
+                    | TokenKind::Char
+            ) {
                 let start = self.current.span.start;
                 let specifiers = self.parse_decl_specifiers()?;
                 ast::BlockItem::Declaration(self.parse_declaration(start, specifiers, None)?)
@@ -307,6 +327,8 @@ impl<'a> Parser<'a> {
             ast::Expr::Binary(span, ..)
             | ast::Expr::Unary(span, ..)
             | ast::Expr::IntLit(span, ..)
+            | ast::Expr::FloatLit(span, ..)
+            | ast::Expr::CharLit(span, ..)
             | ast::Expr::Assignment(span, ..)
             | ast::Expr::Identifier(span, ..) => span,
         }
@@ -323,9 +345,32 @@ impl<'a> Parser<'a> {
             }
             TokenKind::IntLit => {
                 let span = self.current.span;
-                let literal = self.current.literal.clone();
+                let mut literal = self.current.literal.clone();
                 self.advance();
                 Ok(ast::Expr::IntLit(span, literal))
+            }
+            TokenKind::FloatLit => {
+                let span = self.current.span;
+                let mut literal = self.current.literal.clone();
+
+                let mut suffix = ast::FloatSuffix::None;
+
+                if literal.ends_with('f') || literal.ends_with('F') {
+                    suffix = ast::FloatSuffix::Float;
+                }
+
+                if !matches!(suffix, ast::FloatSuffix::None) {
+                    literal.pop();
+                }
+
+                self.advance();
+                Ok(ast::Expr::FloatLit(span, literal, suffix))
+            }
+            TokenKind::CharLit => {
+                let span = self.current.span;
+                let literal = self.current.literal.clone();
+                self.advance();
+                Ok(ast::Expr::CharLit(span, literal))
             }
             TokenKind::LParen => {
                 self.advance();
@@ -336,7 +381,7 @@ impl<'a> Parser<'a> {
             }
             _ => Err(Error::new(
                 self.scanner.source.to_string(),
-                self.file.to_string(),
+                self.filename.to_string(),
                 self.current.span,
                 ErrorKind::ExpectedFound(
                     "expression".to_string(),

@@ -134,6 +134,9 @@ impl PrettyPrinter {
             let name = match specifier {
                 TypeSpecifier::Void => "Void",
                 TypeSpecifier::Int => "Int",
+                TypeSpecifier::Float => "Float",
+                TypeSpecifier::Double => "Double",
+                TypeSpecifier::Char => "Char",
             };
 
             self.line(&prefix, i == len - 1, name);
@@ -228,11 +231,34 @@ impl PrettyPrinter {
                 self.print_span(&span, &prefix, false);
                 self.line(&prefix, last, &format!("Int: ({}){RESET}", value));
             }
+            Expr::FloatLit(span, value, suffix) => {
+                self.line(prefix, last, &format!("{BLUE}FloatLit{RESET}"));
 
+                let prefix = Self::child_prefix(prefix, last);
+
+                let suffix = match suffix {
+                    FloatSuffix::None => "",
+                    FloatSuffix::Float => "f",
+                };
+
+                self.print_span(&span, &prefix, false);
+                self.line(
+                    &prefix,
+                    last,
+                    &format!("Float: ({}{}){RESET}", value, suffix),
+                );
+            }
+            Expr::CharLit(span, value) => {
+                self.line(prefix, last, &format!("{BLUE}CharLit{RESET}"));
+
+                let prefix = Self::child_prefix(prefix, last);
+
+                self.print_span(&span, &prefix, false);
+                self.line(&prefix, last, &format!("Char: ({}){RESET}", value));
+            }
             Expr::Identifier(span, name) => {
                 self.print_identifier(&span, &name, prefix, last);
             }
-
             Expr::Unary(span, op, expr) => {
                 self.line(prefix, last, &format!("{BLUE}Unary{RESET}"));
 
@@ -242,7 +268,6 @@ impl PrettyPrinter {
                 self.print_span(&span, &prefix, false);
                 self.print_expr(expr, &prefix, true);
             }
-
             Expr::Binary(span, lhs, op, rhs) => {
                 self.line(prefix, last, &format!("{BLUE}Binary{RESET}"));
 
@@ -253,7 +278,6 @@ impl PrettyPrinter {
                 self.print_expr(lhs, &prefix, false);
                 self.print_expr(rhs, &prefix, true);
             }
-
             Expr::Assignment(span, lhs, rhs) => {
                 self.line(prefix, last, &format!("{BLUE}Assignment{RESET}"));
 

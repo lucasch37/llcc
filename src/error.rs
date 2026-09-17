@@ -15,6 +15,7 @@ pub enum ErrorKind {
     TypeMismatch(QualType, QualType),
     InitializedFunction,
     NotConstInitializer,
+    IncompleteType(QualType),
 
     // folding errors
     IntegerOverflow(QualType),
@@ -49,8 +50,11 @@ impl ErrorKind {
             ErrorKind::NotConstInitializer => {
                 "Initializer element is not a compile-time constant".to_string()
             }
-            ErrorKind::IntegerOverflow(ty) => {
-                format!("Integer overflow for type '{}'", ty)
+            ErrorKind::IncompleteType(typ) => {
+                format!("Variable has incomplete type '{}'", typ)
+            }
+            ErrorKind::IntegerOverflow(typ) => {
+                format!("Integer overflow for type '{}'", typ)
             }
             ErrorKind::DivisionByZero => "Division by zero".to_string(),
             ErrorKind::MultipleErrors(errors) => {

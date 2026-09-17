@@ -114,8 +114,49 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        if self.current() == Some(b'.') {
+            self.advance();
+
+            while let Some(ch) = self.current() {
+                if ch.is_ascii_digit() {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            let suffix = match self.current() {
+                Some(b'f') | Some(b'F') => {
+                    self.advance();
+                    Some('f')
+                }
+                // Some(b'l') | Some(b'L') => {
+                //     self.advance();
+                //     Some('l')
+                // }
+                _ => None,
+            };
+
+            let literal = &self.source[start..self.pos];
+            return self.make_token(TokenKind::FloatLit, literal, start, line, col);
+        }
+
         let literal = &self.source[start..self.pos];
         self.make_token(TokenKind::IntLit, literal, start, line, col)
+    }
+
+    fn scan_char(&mut self, start: usize, line: usize, col: usize) -> Token {
+        self.advance();
+        while let Some(ch) = self.current() {
+            if ch == b'\'' {
+                self.advance();
+                break;
+            }
+            self.advance();
+        }
+
+        let lieral = &self.source[start..self.pos];
+        self.make_token(TokenKind::CharLit, lieral, start, line, col)
     }
 
     fn scan_identifier(&mut self, start: usize, line: usize, col: usize) -> Token {
@@ -130,7 +171,10 @@ impl<'a> Lexer<'a> {
         let literal = &self.source[start..self.pos];
         let kind = match literal {
             "int" => TokenKind::Int,
+            "float" => TokenKind::Float,
+            "double" => TokenKind::Double,
             "void" => TokenKind::Void,
+            "char" => TokenKind::Char,
             "return" => TokenKind::Return,
             _ => TokenKind::Identifier,
         };
@@ -151,6 +195,7 @@ impl<'a> Lexer<'a> {
             Some(ch) if ch.is_ascii_alphabetic() || ch == b'_' => {
                 self.scan_identifier(start, line, col)
             }
+            Some(b'\'') => self.scan_char(start, line, col),
             Some(b'+') => {
                 self.advance();
                 self.make_token(TokenKind::Plus, "+", start, line, col)

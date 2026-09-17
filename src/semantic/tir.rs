@@ -1,5 +1,8 @@
 use crate::{
-    semantic::{env::Symbol, types::QualType},
+    semantic::{
+        env::Symbol,
+        types::{Primitive, QualType, Type},
+    },
     token::Span,
 };
 
@@ -83,6 +86,53 @@ pub struct Expr {
     pub kind: ExprKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value {
+    Int(i32),
+    Float(f32),
+    Double(f64),
+    Char(i8),
+}
+
+impl Value {
+    pub fn cast_to(self, typ: &Type) -> Option<Self> {
+        match typ {
+            Type::Primitive(Primitive::Int) => Some(Value::Int(match self {
+                Value::Char(v) => v as i32,
+                Value::Int(v) => v,
+                Value::Float(v) => v as i32,
+                Value::Double(v) => v as i32,
+                _ => return None,
+            })),
+
+            Type::Primitive(Primitive::Float) => Some(Value::Float(match self {
+                Value::Char(v) => v as f32,
+                Value::Int(v) => v as f32,
+                Value::Float(v) => v,
+                Value::Double(v) => v as f32,
+                _ => return None,
+            })),
+
+            Type::Primitive(Primitive::Double) => Some(Value::Double(match self {
+                Value::Char(v) => v as f64,
+                Value::Int(v) => v as f64,
+                Value::Float(v) => v as f64,
+                Value::Double(v) => v,
+                _ => return None,
+            })),
+
+            Type::Primitive(Primitive::Char) => Some(Value::Char(match self {
+                Value::Char(v) => v,
+                Value::Int(v) => v as i8,
+                Value::Float(v) => v as i8,
+                Value::Double(v) => v as i8,
+            })),
+
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Binary {
@@ -94,11 +144,15 @@ pub enum ExprKind {
         op: UnaryOp,
         expr: Box<Expr>,
     },
-    IntLit(i32),
+    Value(Value),
     Symbol(Symbol),
     Assignment {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    Cast {
+        new_type: QualType,
+        expr: Box<Expr>,
     },
 }
 
