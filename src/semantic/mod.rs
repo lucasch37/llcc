@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub(crate) mod env;
+mod fold;
 pub(crate) mod tir;
 pub mod types;
 
@@ -82,6 +83,7 @@ impl<'a> SemanticAnalyzer<'a> {
         }
 
         tir::TranslationUnit {
+            symbols: self.scope_tree.symbols().clone(),
             external_declarations,
         }
     }
@@ -138,29 +140,33 @@ impl<'a> SemanticAnalyzer<'a> {
             env::InitType::Declaration
         };
 
-        let mut symbol = self
-            .scope_tree
-            .new_symbol(name.clone(), qtype.clone(), kind);
-
-        if let Some(existing) = self.scope_tree.lookup_local(&name) {
-            if self.scope_tree.check_redefinition(&symbol, existing) {
+        let existing = self.scope_tree.lookup_local(&name);
+        if let Some(existing) = existing {
+            if self.scope_tree.check_redefinition(&qtype, &kind, existing) {
                 return Err(self.error(span, ErrorKind::Redefinition(name)));
-            }
-            if self.scope_tree.is_global() {
-                symbol.id = existing.id;
-                if existing.kind == env::InitType::Definition {
-                    symbol.kind = env::InitType::Definition;
-                }
             }
         }
 
-        self.scope_tree.define(name, symbol.clone());
+        let symbol_id = match existing {
+            Some(existing_id) if self.scope_tree.is_global() => {
+                if kind == env::InitType::Definition {
+                    self.scope_tree.symbol_mut(existing_id).kind = env::InitType::Definition;
+                }
+                existing_id
+            }
+            _ => self
+                .scope_tree
+                .new_symbol(name.clone(), qtype.clone(), kind),
+        };
+
+        self.scope_tree.define(name, symbol_id);
 
         let mut initializer = initializer
             .map(|initializer| match initializer {
                 ast::Initializer::Expr(_, expr) => {
-                    let expr = self.lower_expr(&expr)?;
-                    let expr = self.implicit_cast(expr, qtype.clone())?;
+                    let expr = self.lower_expr(expr.clone())?;
+                    let expr = expr.cast_to(qtype.clone());
+                    let expr = self.fold_expr(expr)?;
 
                     Ok(tir::Initializer::Expr(expr))
                 }
@@ -173,16 +179,9 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         }
 
-        if self.scope_tree.is_global() {
-            if let Some(tir::Initializer::Expr(expr)) = initializer.as_mut() {
-                let value = self.fold_global_variable(expr)?;
-                expr.kind = tir::ExprKind::Value(value);
-            }
-        }
-
         Ok(tir::InitDeclarator {
             span,
-            symbol,
+            symbol_id,
             qtype,
             initializer,
         })
@@ -218,117 +217,7 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
-    fn fold_global_variable(&mut self, expr: &tir::Expr) -> Result<tir::Value> {
-        match &expr.kind {
-            tir::ExprKind::Value(value) => Ok(*value),
-            tir::ExprKind::Cast { new_type, expr } => {
-                let span = expr.span;
-                let value = self.fold_global_variable(expr)?;
-
-                value
-                    .cast_to(&new_type.typ)
-                    .ok_or_else(|| self.error(span, ErrorKind::NotConstInitializer))
-            }
-            tir::ExprKind::Unary { op, expr } => {
-                let value = self.fold_global_variable(expr)?;
-                match op {
-                    tir::UnaryOp::Pos => Ok(value),
-                    tir::UnaryOp::Neg => match value {
-                        tir::Value::Int(value) => {
-                            value.checked_neg().map(tir::Value::Int).ok_or(self.error(
-                                expr.span,
-                                ErrorKind::IntegerOverflow(
-                                    QualType::new(Type::Primitive(Primitive::Int)).into(),
-                                ),
-                            ))
-                        }
-                        tir::Value::Char(value) => Ok(tir::Value::Char(-value)),
-                        tir::Value::Float(value) => Ok(tir::Value::Float(-value)),
-                        tir::Value::Double(value) => Ok(tir::Value::Double(-value)),
-                    },
-                }
-            }
-            tir::ExprKind::Binary { lhs, op, rhs } => {
-                let lhs = self.fold_global_variable(lhs)?;
-                let rhs = self.fold_global_variable(rhs)?;
-                match (lhs, rhs) {
-                    (tir::Value::Int(lhs), tir::Value::Int(rhs)) => {
-                        let value = match op {
-                            tir::BinaryOp::Add => lhs.checked_add(rhs),
-                            tir::BinaryOp::Sub => lhs.checked_sub(rhs),
-                            tir::BinaryOp::Mul => lhs.checked_mul(rhs),
-                            tir::BinaryOp::Div if rhs != 0 => lhs.checked_div(rhs),
-                            tir::BinaryOp::Div => {
-                                return Err(self.error(expr.span, ErrorKind::DivisionByZero));
-                            }
-                        };
-                        value.map(tir::Value::Int).ok_or(self.error(
-                            expr.span,
-                            ErrorKind::IntegerOverflow(
-                                QualType::new(Type::Primitive(Primitive::Int)).into(),
-                            ),
-                        ))
-                    }
-                    (tir::Value::Float(lhs), tir::Value::Float(rhs)) => {
-                        Ok(tir::Value::Float(match op {
-                            tir::BinaryOp::Add => lhs + rhs,
-                            tir::BinaryOp::Sub => lhs - rhs,
-                            tir::BinaryOp::Mul => lhs * rhs,
-                            tir::BinaryOp::Div => lhs / rhs,
-                        }))
-                    }
-                    (tir::Value::Double(lhs), tir::Value::Double(rhs)) => {
-                        Ok(tir::Value::Double(match op {
-                            tir::BinaryOp::Add => lhs + rhs,
-                            tir::BinaryOp::Sub => lhs - rhs,
-                            tir::BinaryOp::Mul => lhs * rhs,
-                            tir::BinaryOp::Div => lhs / rhs,
-                        }))
-                    }
-                    _ => unreachable!("arithmetic operands have a common type"),
-                }
-            }
-            _ => Err(self.error(expr.span, ErrorKind::NotConstInitializer)),
-        }
-    }
-
-    fn implicit_cast(&mut self, expr: tir::Expr, target: QualType) -> Result<tir::Expr> {
-        if expr.qtype == target {
-            return Ok(expr);
-        }
-
-        if !expr.qtype.type_compatible(&target) {
-            return Err(self.error(
-                expr.span,
-                ErrorKind::TypeMismatch(expr.qtype.clone(), target.clone()),
-            ));
-        }
-
-        Ok(tir::Expr {
-            span: expr.span,
-            qtype: target.clone(),
-            kind: tir::ExprKind::Cast {
-                new_type: target.clone(),
-                expr: Box::new(expr),
-            },
-        })
-    }
-
-    fn resolve_arithmetic_type(lhs: &QualType, rhs: &QualType) -> QualType {
-        if matches!(lhs.typ, Type::Primitive(Primitive::Double))
-            || matches!(rhs.typ, Type::Primitive(Primitive::Double))
-        {
-            QualType::new(Type::Primitive(Primitive::Double))
-        } else if matches!(lhs.typ, Type::Primitive(Primitive::Float))
-            || matches!(rhs.typ, Type::Primitive(Primitive::Float))
-        {
-            QualType::new(Type::Primitive(Primitive::Float))
-        } else {
-            QualType::new(Type::Primitive(Primitive::Int))
-        }
-    }
-
-    fn decode_char_literal(literal: &str) -> i8 {
+    fn decode_char_literal(literal: &str) -> u8 {
         let contents = literal
             .strip_prefix('\'')
             .and_then(|value| value.strip_suffix('\''))
@@ -345,93 +234,163 @@ impl<'a> SemanticAnalyzer<'a> {
             bytes => *bytes.last().expect("nonempty character literal"),
         };
 
-        value as i8
+        value as u8
     }
 
-    fn lower_expr(&mut self, expr: &ast::Expr) -> Result<tir::Expr> {
-        let span = *expr.span();
-        let (qtype, kind) = match expr {
-            ast::Expr::IntLit(_, literal) => (
-                QualType::new(Type::Primitive(Primitive::Int)),
-                tir::ExprKind::Value(tir::Value::Int(
-                    literal.parse().expect("validated integer literal"),
+    pub fn lower_expr(&mut self, expr: ast::Expr) -> Result<tir::Expr> {
+        let mut expr = match expr {
+            ast::Expr::Binary(span, lhs, op, rhs) => self.lower_binary(span, *lhs, op, *rhs),
+            ast::Expr::IntLit(span, lit) => Ok(tir::Expr {
+                span,
+                qtype: QualType::new(Type::Primitive(Primitive::Int)),
+                kind: tir::ExprKind::Literal(tir::LiteralKind::Int(
+                    lit.parse().expect("validated integer literal"),
                 )),
-            ),
-            ast::Expr::FloatLit(_, literal, suffix) => match suffix {
-                ast::FloatSuffix::None => (
-                    QualType::new(Type::Primitive(Primitive::Double)),
-                    tir::ExprKind::Value(tir::Value::Double(
-                        literal.parse().expect("validated float literal"),
+                value_kind: tir::ValueKind::RValue,
+            }),
+            ast::Expr::CharLit(span, lit) => Ok(tir::Expr {
+                span,
+                qtype: QualType::new(Type::Primitive(Primitive::Char)),
+                kind: tir::ExprKind::Literal(tir::LiteralKind::Char(Self::decode_char_literal(
+                    &lit,
+                ))),
+                value_kind: tir::ValueKind::RValue,
+            }),
+            ast::Expr::FloatLit(span, lit, suffix) => match suffix {
+                ast::FloatSuffix::None => Ok(tir::Expr {
+                    span,
+                    qtype: QualType::new(Type::Primitive(Primitive::Double)),
+                    kind: tir::ExprKind::Literal(tir::LiteralKind::Double(
+                        lit.parse().expect("validated float literal"),
                     )),
-                ),
-                ast::FloatSuffix::Float => (
-                    QualType::new(Type::Primitive(Primitive::Float)),
-                    tir::ExprKind::Value(tir::Value::Float(
-                        literal.parse().expect("validated float literal"),
+                    value_kind: tir::ValueKind::RValue,
+                }),
+                ast::FloatSuffix::Float => Ok(tir::Expr {
+                    span,
+                    qtype: QualType::new(Type::Primitive(Primitive::Float)),
+                    kind: tir::ExprKind::Literal(tir::LiteralKind::Float(
+                        lit.parse().expect("validated float literal"),
                     )),
-                ),
+                    value_kind: tir::ValueKind::RValue,
+                }),
             },
-            ast::Expr::CharLit(_, literal) => (
-                QualType::new(Type::Primitive(Primitive::Char)),
-                tir::ExprKind::Value(tir::Value::Char(Self::decode_char_literal(literal))),
-            ),
-            ast::Expr::Identifier(_, name) => {
+            ast::Expr::Identifier(span, name) => {
                 let Some(symbol) = self.scope_tree.lookup(&name) else {
                     return Err(self.error(span, ErrorKind::UndeclaredIdent(name.clone())));
                 };
+                let qtype = self.scope_tree.symbol(symbol).qtype.clone();
 
-                (symbol.qtype.clone(), tir::ExprKind::Symbol(symbol.clone()))
+                Ok(tir::Expr {
+                    span,
+                    qtype,
+                    kind: tir::ExprKind::Symbol(symbol),
+                    value_kind: tir::ValueKind::LValue,
+                })
             }
-            ast::Expr::Binary(_, lhs, op, rhs) => {
-                let lhs = self.lower_expr(lhs)?;
-                let rhs = self.lower_expr(rhs)?;
-
-                let result_type = Self::resolve_arithmetic_type(&lhs.qtype, &rhs.qtype);
-
-                let lhs = Box::new(self.implicit_cast(lhs, result_type.clone())?);
-                let rhs = Box::new(self.implicit_cast(rhs, result_type.clone())?);
-
-                let op = match op {
-                    ast::BinaryOp::Add => tir::BinaryOp::Add,
-                    ast::BinaryOp::Sub => tir::BinaryOp::Sub,
-                    ast::BinaryOp::Mul => tir::BinaryOp::Mul,
-                    ast::BinaryOp::Div => tir::BinaryOp::Div,
-                };
-
-                (lhs.qtype.clone(), tir::ExprKind::Binary { lhs, op, rhs })
-            }
-            ast::Expr::Unary(_, op, expr) => {
-                let expr = Box::new(self.lower_expr(expr)?);
+            ast::Expr::Unary(span, op, expr) => {
+                let expr = Box::new(self.lower_expr(*expr)?);
                 let qtype = expr.qtype.clone();
+
                 let op = match op {
                     ast::UnaryOp::Pos => tir::UnaryOp::Pos,
                     ast::UnaryOp::Neg => tir::UnaryOp::Neg,
                 };
-                (qtype, tir::ExprKind::Unary { op, expr })
+
+                Ok(tir::Expr {
+                    span,
+                    qtype,
+                    kind: tir::ExprKind::Unary { op, expr },
+                    value_kind: tir::ValueKind::RValue,
+                })
             }
-            ast::Expr::Assignment(_, lhs, rhs) => {
-                let lhs = self.lower_expr(lhs)?;
-                let rhs = self.lower_expr(rhs)?;
+            ast::Expr::Assignment(span, lhs, rhs) => {
+                let lhs = self.lower_expr(*lhs)?;
+                let rhs = self.lower_expr(*rhs)?;
 
                 if !matches!(lhs.kind, tir::ExprKind::Symbol(_)) {
-                    Err(self.error(lhs.span, ErrorKind::InvalidAssignmentTarget))?;
+                    return Err(self.error(lhs.span, ErrorKind::InvalidAssignmentTarget));
                 }
 
                 if !lhs.qtype.type_compatible(&rhs.qtype) {
-                    Err(self.error(
+                    return Err(self.error(
                         span,
                         ErrorKind::TypeMismatch(lhs.qtype.clone(), rhs.qtype.clone()),
-                    ))?;
+                    ));
                 }
 
-                let lhs = Box::new(self.implicit_cast(lhs.clone(), lhs.qtype.clone())?);
-                let rhs = Box::new(self.implicit_cast(rhs.clone(), lhs.qtype.clone())?);
+                let rhs = rhs.cast_to(lhs.qtype.clone());
 
-                (lhs.qtype.clone(), tir::ExprKind::Assignment { lhs, rhs })
+                Ok(tir::Expr {
+                    span,
+                    qtype: lhs.qtype.clone(),
+                    kind: tir::ExprKind::Assignment {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                    value_kind: tir::ValueKind::RValue,
+                })
             }
+
+            _ => todo!(),
         };
 
-        Ok(tir::Expr { span, qtype, kind })
+        expr = self.fold_expr(expr?);
+
+        expr
+    }
+
+    pub fn lower_binary(
+        &mut self,
+        span: Span,
+        lhs: ast::Expr,
+        op: ast::BinaryOp,
+        rhs: ast::Expr,
+    ) -> Result<tir::Expr> {
+        let left = self.lower_expr(lhs)?;
+        let right = self.lower_expr(rhs)?;
+
+        let left = left.int_promote();
+        let right = right.int_promote();
+
+        let (left, right) = Self::arithmetic_promotion(left, right);
+
+        Ok(tir::Expr {
+            span,
+            qtype: left.qtype.clone(),
+            kind: tir::ExprKind::Binary {
+                lhs: Box::new(left),
+                op: match op {
+                    ast::BinaryOp::Add => tir::BinaryOp::Add,
+                    ast::BinaryOp::Sub => tir::BinaryOp::Sub,
+                    ast::BinaryOp::Mul => tir::BinaryOp::Mul,
+                    ast::BinaryOp::Div => tir::BinaryOp::Div,
+                },
+                rhs: Box::new(right),
+            },
+            value_kind: tir::ValueKind::RValue,
+        })
+    }
+
+    pub fn arithmetic_promotion(left: tir::Expr, right: tir::Expr) -> (tir::Expr, tir::Expr) {
+        if left.qtype.typ.is_void() || right.qtype.typ.is_void() {
+            return (left, right);
+        }
+
+        match (&left.qtype.typ, &right.qtype.typ) {
+            (Type::Primitive(Primitive::Double), _) | (_, Type::Primitive(Primitive::Double)) => {
+                let left = left.cast_to(QualType::new(Type::Primitive(Primitive::Double)));
+                let right = right.cast_to(QualType::new(Type::Primitive(Primitive::Double)));
+                (left, right)
+            }
+
+            (Type::Primitive(Primitive::Float), _) | (_, Type::Primitive(Primitive::Float)) => {
+                let left = left.cast_to(QualType::new(Type::Primitive(Primitive::Float)));
+                let right = right.cast_to(QualType::new(Type::Primitive(Primitive::Float)));
+                (left, right)
+            }
+
+            _ => (left, right),
+        }
     }
 
     pub fn lower_function_def(
@@ -447,26 +406,31 @@ impl<'a> SemanticAnalyzer<'a> {
             variadic: false,
         };
 
-        let symbol = self.scope_tree.new_symbol(
-            name.clone(),
-            QualType::new(Type::Function(func_type.clone())),
-            env::InitType::Definition,
-        );
+        let qtype = QualType::new(Type::Function(func_type.clone()));
+        let kind = env::InitType::Definition;
+        let existing = self.scope_tree.lookup(&name);
 
-        match self.scope_tree.lookup(&name) {
-            Some(existing) => {
-                if self.scope_tree.check_redefinition(&symbol, existing) {
-                    return Err(self.error(function_def.span, ErrorKind::Redefinition(name)));
-                }
+        if let Some(existing) = existing {
+            if self.scope_tree.check_redefinition(&qtype, &kind, existing) {
+                return Err(self.error(function_def.span, ErrorKind::Redefinition(name)));
             }
-            None => {}
+        }
+
+        let symbol = match existing {
+            Some(existing) => {
+                self.scope_tree.symbol_mut(existing).kind = env::InitType::Definition;
+                existing
+            }
+            None => self
+                .scope_tree
+                .new_symbol(name.clone(), qtype.clone(), kind),
         };
 
         self.current_function = Some(FunctionContext {
             return_type: func_type.return_type.as_ref().clone(),
         });
 
-        self.scope_tree.define(name, symbol.clone());
+        self.scope_tree.define(name, symbol);
 
         self.scope_tree.enter();
 
@@ -476,8 +440,8 @@ impl<'a> SemanticAnalyzer<'a> {
 
         Ok(tir::FunctionDef {
             span: function_def.span,
-            symbol,
-            qtype: QualType::new(Type::Function(func_type.clone())),
+            symbol_id: symbol,
+            qtype,
             params: Vec::new(),
             body: compound_stmt,
         })
@@ -537,7 +501,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
             ast::Stmt::Expression(span, expr) => Ok(tir::Stmt::Expression {
                 span: *span,
-                expr: self.lower_expr(expr.as_ref())?,
+                expr: self.lower_expr(*expr.clone())?,
             }),
         }
     }
@@ -546,7 +510,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let return_type = self.current_function.as_ref().unwrap().return_type.clone();
 
         let expr = if let Some(expr) = expr {
-            let expr = self.lower_expr(expr)?;
+            let expr = self.lower_expr(expr.clone())?;
 
             if !return_type.type_compatible(&expr.qtype) {
                 return Err(self.error(
@@ -555,7 +519,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 ));
             }
 
-            Some(self.implicit_cast(expr, return_type.clone())?)
+            Some(self.fold_expr(expr.cast_to(return_type.clone()))?)
         } else {
             let typ = QualType::new(Type::Primitive(Primitive::Void));
 

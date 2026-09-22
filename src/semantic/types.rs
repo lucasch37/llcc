@@ -70,6 +70,22 @@ impl Type {
         matches!(self, Type::Primitive(Primitive::Void))
     }
 
+    pub fn is_int(&self) -> bool {
+        matches!(self, Type::Primitive(Primitive::Int))
+    }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self, Type::Primitive(Primitive::Float))
+    }
+
+    pub fn is_double(&self) -> bool {
+        matches!(self, Type::Primitive(Primitive::Double))
+    }
+
+    pub fn is_char(&self) -> bool {
+        matches!(self, Type::Primitive(Primitive::Char))
+    }
+
     pub fn is_function(&self) -> bool {
         matches!(self, Type::Function(_))
     }
@@ -79,6 +95,13 @@ impl Type {
             Type::Invalid => 0,
             Type::Primitive(p) => p.size(),
             Type::Function(_) => 0,
+        }
+    }
+
+    pub fn get_primitive(&self) -> Option<&Primitive> {
+        match self {
+            Type::Primitive(p) => Some(p),
+            _ => None,
         }
     }
 }

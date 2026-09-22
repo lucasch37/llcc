@@ -1,6 +1,6 @@
 use crate::{
     semantic::{
-        env::Symbol,
+        env::{SymbolId, SymbolTable},
         types::{Primitive, QualType, Type},
     },
     token::Span,
@@ -8,6 +8,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct TranslationUnit {
+    pub symbols: SymbolTable,
     pub external_declarations: Vec<ExternalDeclaration>,
 }
 
@@ -20,7 +21,7 @@ pub enum ExternalDeclaration {
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub span: Span,
-    pub symbol: Symbol,
+    pub symbol_id: SymbolId,
     pub qtype: QualType,
     pub params: Vec<Parameter>,
     pub body: CompoundStmt,
@@ -29,7 +30,7 @@ pub struct FunctionDef {
 #[derive(Debug, Clone)]
 pub struct Parameter {
     pub span: Span,
-    pub symbol: Symbol,
+    pub symbol_id: SymbolId,
     pub qtype: QualType,
 }
 
@@ -42,7 +43,7 @@ pub struct Declaration {
 #[derive(Debug, Clone)]
 pub struct InitDeclarator {
     pub span: Span,
-    pub symbol: Symbol,
+    pub symbol_id: SymbolId,
     pub qtype: QualType,
     pub initializer: Option<Initializer>,
 }
@@ -79,56 +80,43 @@ pub enum BlockItem {
     Statement(Stmt),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueKind {
+    LValue,
+    RValue,
+}
+
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub span: Span,
     pub qtype: QualType,
     pub kind: ExprKind,
+    pub value_kind: ValueKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Value {
-    Int(i32),
-    Float(f32),
-    Double(f64),
-    Char(i8),
-}
+impl Expr {
+    pub fn int_promote(self) -> Expr {
+        if self.qtype.typ.get_primitive().is_none() || self.qtype.typ.is_void() {
+            return self;
+        }
 
-impl Value {
-    pub fn cast_to(self, typ: &Type) -> Option<Self> {
-        match typ {
-            Type::Primitive(Primitive::Int) => Some(Value::Int(match self {
-                Value::Char(v) => v as i32,
-                Value::Int(v) => v,
-                Value::Float(v) => v as i32,
-                Value::Double(v) => v as i32,
-                _ => return None,
-            })),
+        // chars become ints
+        if self.qtype.typ.size() < Type::Primitive(Primitive::Int).size() {
+            self.cast_to(QualType::new(Type::Primitive(Primitive::Int)))
+        } else {
+            self
+        }
+    }
 
-            Type::Primitive(Primitive::Float) => Some(Value::Float(match self {
-                Value::Char(v) => v as f32,
-                Value::Int(v) => v as f32,
-                Value::Float(v) => v,
-                Value::Double(v) => v as f32,
-                _ => return None,
-            })),
-
-            Type::Primitive(Primitive::Double) => Some(Value::Double(match self {
-                Value::Char(v) => v as f64,
-                Value::Int(v) => v as f64,
-                Value::Float(v) => v as f64,
-                Value::Double(v) => v,
-                _ => return None,
-            })),
-
-            Type::Primitive(Primitive::Char) => Some(Value::Char(match self {
-                Value::Char(v) => v,
-                Value::Int(v) => v as i8,
-                Value::Float(v) => v as i8,
-                Value::Double(v) => v as i8,
-            })),
-
-            _ => None,
+    pub fn cast_to(self, new_type: QualType) -> Self {
+        Self {
+            qtype: new_type.clone(),
+            value_kind: ValueKind::RValue,
+            span: self.span.clone(),
+            kind: ExprKind::Cast {
+                new_type,
+                expr: Box::new(self),
+            },
         }
     }
 }
@@ -144,8 +132,8 @@ pub enum ExprKind {
         op: UnaryOp,
         expr: Box<Expr>,
     },
-    Value(Value),
-    Symbol(Symbol),
+    Literal(LiteralKind),
+    Symbol(SymbolId),
     Assignment {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
@@ -168,4 +156,12 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Pos,
     Neg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LiteralKind {
+    Int(i32),
+    Float(f32),
+    Double(f64),
+    Char(u8),
 }

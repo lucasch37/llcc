@@ -1,400 +1,587 @@
-use crate::semantic::{
-    env::SymbolId,
-    tir::{
-        self, BinaryOp, BlockItem, ExprKind, ExternalDeclaration, Initializer, Stmt, UnaryOp, Value,
-    },
-    types::{Primitive, Type},
-};
-use std::{collections::HashMap, fmt::Write};
+mod allocation;
+mod asm;
+mod lir;
+mod register;
 
-#[derive(Default)]
+use std::collections::HashMap;
+
+use crate::codegen::lir::LabelId;
+use crate::codegen::register::Global;
+use crate::semantic::env::SymbolId;
+use crate::semantic::tir;
+use crate::semantic::types::{Primitive, Type};
+
+use allocation::{LiveInterval, RegisterAllocator};
+use lir::{CastKind, Lir};
+use register::{Allocation, ImmediateValue, Operand, PhysicalReg, StackSlot, VRegId, VirtualReg};
+
 pub struct Codegen {
-    output: String,
-    locals: HashMap<SymbolId, usize>,
-    globals: HashMap<SymbolId, String>,
-    return_label: String,
-    frame_used: usize,
+    unit: tir::TranslationUnit,
+    instructions: Vec<Lir>,
+
+    next_vreg: usize,
+    next_label: usize,
+    instruction_index: usize,
+
+    live_starts: HashMap<VRegId, usize>,
+    live_intervals: HashMap<VRegId, LiveInterval>,
+    allocations: HashMap<VRegId, Allocation>,
+
+    globals: HashMap<SymbolId, Operand>,
+    locals: HashMap<SymbolId, Operand>,
+
+    stack_size: usize,
+}
+
+struct GlobalObject {
+    symbol_id: SymbolId,
+    initializer: Option<tir::Initializer>,
 }
 
 impl Codegen {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new(unit: tir::TranslationUnit) -> Self {
+        Self {
+            unit,
+            instructions: Vec::new(),
 
-    pub fn generate(mut self, unit: &tir::TranslationUnit) -> String {
-        self.line(".intel_syntax noprefix");
+            next_vreg: 0,
+            next_label: 0,
+            instruction_index: 0,
 
-        self.emit_globals_vars(unit);
+            live_starts: HashMap::new(),
+            live_intervals: HashMap::new(),
+            allocations: HashMap::new(),
 
-        self.line(".text");
+            globals: HashMap::new(),
+            locals: HashMap::new(),
 
-        for declaration in &unit.external_declarations {
-            if let ExternalDeclaration::FunctionDef(function) = declaration {
-                self.emit_function(function);
-            }
+            stack_size: 0,
         }
-
-        self.output
     }
 
-    fn line(&mut self, value: &str) {
-        writeln!(self.output, "{value}").unwrap();
+    pub fn generate(mut self) -> String {
+        self.lower_translation_unit();
+        asm::Asm::new(&self.allocations).emit_all(&self.instructions)
     }
 
-    fn get_primitive(typ: &Type) -> &Primitive {
-        let Type::Primitive(primitive) = typ else {
-            unreachable!("expected scalar type")
+    fn write_lir(&mut self, instruction: Lir) {
+        self.instructions.push(instruction);
+        self.instruction_index += 1;
+    }
+
+    fn temp(&mut self, typ: Type) -> Operand {
+        let id = VRegId(self.next_vreg);
+        self.next_vreg += 1;
+
+        self.live_starts.insert(id, self.instruction_index);
+
+        Operand::Virtual(VirtualReg { id, typ })
+    }
+
+    fn free(&mut self, operand: &Operand) {
+        let Operand::Virtual(reg) = operand else {
+            return;
         };
 
-        primitive
+        let Some(start) = self.live_starts.remove(&reg.id) else {
+            return;
+        };
+
+        self.live_intervals.insert(
+            reg.id,
+            LiveInterval::new(start, self.instruction_index, reg.typ.clone()),
+        );
     }
 
-    fn constant(initializer: &Initializer) -> Value {
-        let Initializer::Expr(expr) = initializer;
-        match expr.kind {
-            ExprKind::Value(value) => value,
-            _ => unreachable!("global initializer was not folded"),
+    fn make_temp(&mut self, value: Operand) -> Operand {
+        if matches!(value, Operand::Virtual(_)) {
+            return value;
+        }
+
+        let typ = value
+            .typ()
+            .expect("void cannot be moved into a temporary")
+            .clone();
+
+        let result = self.temp(typ);
+
+        self.write_lir(Lir::Mov {
+            dst: result.clone(),
+            src: value,
+        });
+
+        result
+    }
+
+    fn stack_slot(&mut self, typ: Type) -> Operand {
+        let size = typ.size();
+
+        self.stack_size += size;
+
+        let align = size.max(1);
+        self.stack_size = (self.stack_size + align - 1) / align * align;
+
+        Operand::Stack(StackSlot {
+            offset: self.stack_size,
+            typ,
+        })
+    }
+
+    pub fn get_var(&self, symbol: &SymbolId) -> Operand {
+        if let Some(global) = self.globals.get(symbol) {
+            return global.clone();
+        }
+        if let Some(local) = self.locals.get(symbol) {
+            return local.clone();
+        }
+
+        unreachable!(
+            "symbol should be either a global or a local variable: {:?}",
+            symbol
+        )
+    }
+
+    pub fn new_label(&mut self) -> LabelId {
+        let id = LabelId(self.next_label);
+        self.next_label += 1;
+        id
+    }
+
+    fn lower_translation_unit(&mut self) {
+        self.lower_globals(self.unit.external_declarations.clone());
+
+        for decl in self.unit.external_declarations.clone() {
+            match decl {
+                tir::ExternalDeclaration::FunctionDef(func) => {
+                    self.lower_function_def(&func);
+                }
+                tir::ExternalDeclaration::Declaration(_) => {}
+            }
         }
     }
 
-    fn emit_globals_vars(&mut self, unit: &tir::TranslationUnit) {
-        let mut objects: Vec<(&str, Value)> = vec![];
-        // indices to handle tentative definitions of the same global variable
-        let mut indices = HashMap::new();
+    fn lower_globals(&mut self, decls: Vec<tir::ExternalDeclaration>) {
+        let mut globals = HashMap::<SymbolId, GlobalObject>::new();
 
-        for external in &unit.external_declarations {
-            let ExternalDeclaration::Declaration(declaration) = external else {
+        for decl in decls {
+            let tir::ExternalDeclaration::Declaration(decl) = decl else {
                 continue;
             };
 
-            for global in &declaration.declarators {
-                if global.qtype.typ.is_function() {
+            for declarator in decl.declarators {
+                let symbol_id = declarator.symbol_id;
+
+                let typ = declarator.qtype.typ.clone();
+                if typ.is_function() {
                     continue;
                 }
 
-                self.globals
-                    .insert(global.symbol.id, global.symbol.name.clone());
+                let global = globals.entry(symbol_id).or_insert(GlobalObject {
+                    symbol_id,
+                    initializer: None,
+                });
 
-                let zero = match Self::get_primitive(&global.qtype.typ) {
-                    Primitive::Int => Value::Int(0),
-                    Primitive::Float => Value::Float(0.0),
-                    Primitive::Double => Value::Double(0.0),
-                    Primitive::Char => Value::Char(0),
-                    Primitive::Void => unreachable!(),
-                };
-
-                let index = *indices
-                    .entry(global.symbol.name.clone())
-                    .or_insert_with(|| {
-                        objects.push((&global.symbol.name, zero));
-                        objects.len() - 1
-                    });
-
-                // update the value if it is a definition (not tentative)
-                if let Some(initializer) = &global.initializer {
-                    objects[index].1 = Self::constant(initializer);
+                if let Some(initializer) = declarator.initializer {
+                    global.initializer = Some(initializer);
                 }
             }
         }
 
-        for (name, value) in objects {
-            let (size, zero) = match value {
-                Value::Char(v) => (1, v == 0),
-                Value::Int(v) => (4, v == 0),
-                Value::Float(v) => (4, v == 0.0),
-                Value::Double(v) => (8, v == 0.0),
-            };
-
-            if zero {
-                self.line(&format!(".globl _{name}"));
-                self.line(&format!(
-                    ".zerofill __DATA,__bss,_{name},{size},{}",
-                    if size == 8 {
-                        3
-                    } else if size == 4 {
-                        2
-                    } else {
-                        0
-                    }
-                ));
-                continue;
-            }
-
-            self.line(".data");
-            self.line(if size == 8 {
-                ".p2align 3"
-            } else if size == 4 {
-                ".p2align 2"
-            } else {
-                ".p2align 0"
-            });
-            self.line(&format!(".globl _{name}"));
-            self.line(&format!("_{name}:"));
-
-            match value {
-                Value::Char(v) => self.line(&format!("    .byte {v}")),
-                Value::Int(v) => self.line(&format!("    .long {v}")),
-                Value::Float(v) => self.line(&format!("    .long {}", v.to_bits())),
-                Value::Double(v) => self.line(&format!("    .quad {}", v.to_bits())),
-            }
+        for (symbol_id, global) in globals {
+            self.lower_global_decl(symbol_id, global);
         }
     }
 
-    fn allocate_locals(&mut self, block: &tir::CompoundStmt) {
-        for item in &block.items {
-            match item {
-                BlockItem::Declaration(declaration) => {
-                    for local in &declaration.declarators {
-                        let size = local.qtype.typ.size();
-                        self.frame_used = self.frame_used.div_ceil(size) * size + size;
-                        self.locals.insert(local.symbol.id, self.frame_used);
-                    }
-                }
-                BlockItem::Statement(Stmt::Compound(block)) => self.allocate_locals(block),
-                BlockItem::Statement(_) => {}
+    fn lower_global_decl(&mut self, symbol_id: SymbolId, global_obj: GlobalObject) {
+        let symbol = self.unit.symbols.get(symbol_id).unwrap().clone();
+
+        let global = Operand::Global(Global {
+            name: symbol.name.clone(),
+            typ: symbol.qtype.typ.clone(),
+        });
+
+        self.globals
+            .entry(symbol_id)
+            .or_insert_with(|| global.clone());
+
+        let initializer = if let Some(initializer) = global_obj.initializer {
+            match initializer {
+                tir::Initializer::Expr(expr) => Some(self.lower_global_constant(expr)),
             }
-        }
-    }
-
-    fn emit_function(&mut self, function: &tir::FunctionDef) {
-        self.locals.clear();
-        self.frame_used = 0;
-
-        self.allocate_locals(&function.body);
-
-        let frame_size = self.frame_used.div_ceil(16) * 16;
-        let name = &function.symbol.name;
-
-        self.return_label = format!("Lreturn_{}", function.symbol.id.0);
-
-        self.line(".p2align 4");
-        self.line(&format!(".globl _{name}"));
-        self.line(&format!("_{name}:"));
-        self.line("    push rbp");
-        self.line("    mov rbp, rsp");
-
-        if frame_size > 0 {
-            self.line(&format!("    sub rsp, {frame_size}"));
-        }
-
-        self.emit_block(&function.body);
-
-        if name == "main" {
-            self.line("    mov eax, 0");
-        }
-
-        self.line(&format!("{}:", self.return_label));
-        self.line("    mov rsp, rbp");
-        self.line("    pop rbp");
-        self.line("    ret");
-    }
-
-    fn emit_block(&mut self, block: &tir::CompoundStmt) {
-        for item in &block.items {
-            match item {
-                BlockItem::Declaration(declaration) => {
-                    for local in &declaration.declarators {
-                        if let Some(Initializer::Expr(expr)) = &local.initializer {
-                            self.emit_expr(expr);
-                            self.store(local.symbol.id, &local.qtype.typ);
-                        }
-                    }
-                }
-                BlockItem::Statement(stmt) => self.emit_stmt(stmt),
-            }
-        }
-    }
-
-    fn emit_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Compound(block) => self.emit_block(block),
-            Stmt::Expression { expr, .. } => self.emit_expr(expr),
-            Stmt::Return { expr, .. } => {
-                if let Some(expr) = expr {
-                    self.emit_expr(expr);
-                }
-                self.line(&format!("    jmp {}", self.return_label));
-            }
-        }
-    }
-
-    fn address(&self, id: SymbolId) -> String {
-        if let Some(offset) = self.locals.get(&id) {
-            format!("[rbp - {offset}]")
-        } else if let Some(name) = self.globals.get(&id) {
-            format!("[rip + _{name}]")
         } else {
-            unreachable!("unknown object symbol")
-        }
-    }
-
-    fn load(&mut self, id: SymbolId, typ: &Type) {
-        let address = self.address(id);
-        self.line(&match Self::get_primitive(typ) {
-            Primitive::Int => format!("    mov eax, DWORD PTR {address}"),
-            Primitive::Float => format!("    movss xmm0, DWORD PTR {address}"),
-            Primitive::Double => format!("    movsd xmm0, QWORD PTR {address}"),
-            Primitive::Char => format!("    movsx eax, BYTE PTR {address}"),
-            Primitive::Void => unreachable!(),
-        });
-    }
-
-    fn store(&mut self, id: SymbolId, typ: &Type) {
-        let address = self.address(id);
-        self.line(&match Self::get_primitive(typ) {
-            Primitive::Int => format!("    mov DWORD PTR {address}, eax"),
-            Primitive::Float => format!("    movss DWORD PTR {address}, xmm0"),
-            Primitive::Double => format!("    movsd QWORD PTR {address}, xmm0"),
-            Primitive::Char => format!("    mov BYTE PTR {address}, al"),
-            Primitive::Void => unreachable!(),
-        });
-    }
-
-    fn emit_global_var(&mut self, value: Value) {
-        match value {
-            Value::Char(value) => self.line(&format!("    mov eax, {value}")),
-            Value::Int(value) => self.line(&format!("    mov eax, {value}")),
-            Value::Float(value) => {
-                self.line(&format!("    mov eax, {}", value.to_bits()));
-                self.line("    movd xmm0, eax");
-            }
-            Value::Double(value) => {
-                self.line(&format!("    movabs rax, {}", value.to_bits()));
-                self.line("    movq xmm0, rax");
-            }
-        }
-    }
-
-    fn emit_expr(&mut self, expr: &tir::Expr) {
-        match &expr.kind {
-            ExprKind::Value(value) => self.emit_global_var(*value),
-            ExprKind::Symbol(symbol) => self.load(symbol.id, &symbol.qtype.typ),
-            ExprKind::Cast {
-                new_type,
-                expr: inner,
-            } => {
-                self.emit_expr(inner);
-                match (
-                    Self::get_primitive(&inner.qtype.typ),
-                    Self::get_primitive(&new_type.typ),
-                ) {
-                    // castings
-                    (Primitive::Int, Primitive::Float) => self.line("    cvtsi2ss xmm0, eax"),
-                    (Primitive::Int, Primitive::Double) => self.line("    cvtsi2sd xmm0, eax"),
-                    (Primitive::Float, Primitive::Int) => self.line("    cvttss2si eax, xmm0"),
-                    (Primitive::Double, Primitive::Int) => self.line("    cvttsd2si eax, xmm0"),
-                    (Primitive::Float, Primitive::Double) => self.line("    cvtss2sd xmm0, xmm0"),
-                    (Primitive::Double, Primitive::Float) => self.line("    cvtsd2ss xmm0, xmm0"),
-                    (Primitive::Char, Primitive::Int) => {}
-                    (Primitive::Int, Primitive::Char) => self.line("    movsx eax, al"),
-                    (Primitive::Char, Primitive::Float) => self.line("    cvtsi2ss xmm0, eax"),
-                    (Primitive::Char, Primitive::Double) => self.line("    cvtsi2sd xmm0, eax"),
-                    (Primitive::Float, Primitive::Char) => {
-                        self.line("    cvttss2si eax, xmm0");
-                        self.line("    movsx eax, al");
-                    }
-                    (Primitive::Double, Primitive::Char) => {
-                        self.line("    cvttsd2si eax, xmm0");
-                        self.line("    movsx eax, al");
-                    }
-                    (source, target) if source == target => {}
-                    _ => unreachable!("invalid cast"),
-                }
-            }
-            ExprKind::Unary { op, expr: inner } => {
-                self.emit_expr(inner);
-
-                if matches!(op, UnaryOp::Neg) {
-                    self.negative(Self::get_primitive(&expr.qtype.typ));
-                }
-            }
-            ExprKind::Binary { lhs, op, rhs } => self.emit_binary(expr, lhs, *op, rhs),
-            ExprKind::Assignment { lhs, rhs } => {
-                let ExprKind::Symbol(symbol) = &lhs.kind else {
-                    unreachable!("Assignment target must be a symbol")
-                };
-
-                self.emit_expr(rhs);
-                self.store(symbol.id, &symbol.qtype.typ);
-            }
-        }
-    }
-
-    // make the value in eax/xmm0 negative, depending on the type
-    fn negative(&mut self, typ: &Primitive) {
-        match typ {
-            Primitive::Int => self.line("    neg eax"),
-            Primitive::Char => {
-                self.line("    neg eax");
-                self.line("    movsx eax, al");
-            }
-            Primitive::Float => {
-                self.line("    mov eax, 2147483648");
-                self.line("    movd xmm1, eax");
-                self.line("    xorps xmm0, xmm1");
-            }
-            Primitive::Double => {
-                self.line("    movabs rax, 9223372036854775808");
-                self.line("    movq xmm1, rax");
-                self.line("    xorpd xmm0, xmm1");
-            }
-            Primitive::Void => unreachable!(),
-        }
-    }
-
-    fn emit_binary(&mut self, whole: &tir::Expr, lhs: &tir::Expr, op: BinaryOp, rhs: &tir::Expr) {
-        self.emit_expr(lhs);
-
-        if matches!(
-            Self::get_primitive(&whole.qtype.typ),
-            Primitive::Int | Primitive::Char
-        ) {
-            self.line("    push rax");
-            self.emit_expr(rhs);
-            self.line("    mov ecx, eax");
-            self.line("    pop rax");
-
-            match op {
-                BinaryOp::Add => self.line("    add eax, ecx"),
-                BinaryOp::Sub => self.line("    sub eax, ecx"),
-                BinaryOp::Mul => self.line("    imul eax, ecx"),
-                BinaryOp::Div => {
-                    self.line("    cdq");
-                    self.line("    idiv ecx");
-                }
-            }
-
-            if matches!(Self::get_primitive(&whole.qtype.typ), Primitive::Char) {
-                self.line("    movsx eax, al");
-            }
-
-            return;
-        }
-
-        // whether to use float or double logic
-        let is_float = matches!(Self::get_primitive(&whole.qtype.typ), Primitive::Float);
-
-        let mov = if is_float { "movss" } else { "movsd" };
-        let ptr = if is_float { "DWORD" } else { "QWORD" };
-
-        self.line("    sub rsp, 16");
-        self.line(&format!("    {mov} {ptr} PTR [rsp], xmm0"));
-        self.emit_expr(rhs);
-        self.line("    movaps xmm1, xmm0");
-        self.line(&format!("    {mov} xmm0, {ptr} PTR [rsp]"));
-        self.line("    add rsp, 16");
-
-        let instruction = match (is_float, op) {
-            (true, BinaryOp::Add) => "addss",
-            (true, BinaryOp::Sub) => "subss",
-            (true, BinaryOp::Mul) => "mulss",
-            (true, BinaryOp::Div) => "divss",
-            (false, BinaryOp::Add) => "addsd",
-            (false, BinaryOp::Sub) => "subsd",
-            (false, BinaryOp::Mul) => "mulsd",
-            (false, BinaryOp::Div) => "divsd",
+            None
         };
 
-        self.line(&format!("    {instruction} xmm0, xmm1"));
+        self.write_lir(Lir::Global {
+            name: symbol.name.clone(),
+            typ: symbol.qtype.typ.clone(),
+            initializer,
+        });
+    }
+
+    fn lower_global_constant(&self, expr: tir::Expr) -> ImmediateValue {
+        match &expr.kind {
+            tir::ExprKind::Literal(tir::LiteralKind::Int(value)) => {
+                ImmediateValue::Int(*value as i32)
+            }
+            tir::ExprKind::Literal(tir::LiteralKind::Float(value)) => {
+                ImmediateValue::Float(*value as f32)
+            }
+            tir::ExprKind::Literal(tir::LiteralKind::Double(value)) => {
+                ImmediateValue::Double(*value as f64)
+            }
+            tir::ExprKind::Literal(tir::LiteralKind::Char(value)) => {
+                ImmediateValue::Char(*value as u8)
+            }
+
+            _ => unreachable!("semantic analysis should guarantee a constant global initializer"),
+        }
+    }
+
+    fn lower_function_def(&mut self, func: &tir::FunctionDef) {
+        let symbol = self.unit.symbols.get(func.symbol_id).unwrap().clone();
+        let Type::Function(function_type) = &symbol.qtype.typ else {
+            unreachable!("function definition symbol must have a function type")
+        };
+        let return_type = function_type.return_type.typ.clone();
+
+        self.stack_size = 0;
+        self.locals.clear();
+        self.live_starts.clear();
+        self.live_intervals.clear();
+
+        let start_index = self.instructions.len();
+
+        let return_label = self.new_label();
+
+        self.write_lir(Lir::FunctionStart {
+            name: symbol.name.clone(),
+            stack_size: 0,
+        });
+
+        // TODO: lower params
+
+        self.lower_compound_stmt(func.body.clone(), &return_type, return_label.clone());
+
+        assert!(
+            self.live_starts.is_empty(),
+            "all virtual registers must be freed before allocating a function"
+        );
+
+        let intervals = std::mem::take(&mut self.live_intervals);
+        let allocation = RegisterAllocator::new(self.stack_size).allocate(&intervals);
+        self.allocations.extend(allocation.allocations);
+
+        if let Lir::FunctionStart { stack_size, .. } = &mut self.instructions[start_index] {
+            *stack_size = allocation.stack_size;
+        }
+
+        self.write_lir(Lir::Label(return_label));
+        self.write_lir(Lir::FunctionEnd);
+    }
+
+    fn lower_stmt(&mut self, stmt: tir::Stmt, return_type: &Type, return_label: LabelId) {
+        match stmt {
+            tir::Stmt::Compound(compound) => {
+                self.lower_compound_stmt(compound, return_type, return_label);
+            }
+            tir::Stmt::Return { expr, .. } => {
+                self.lower_return(expr.as_ref(), return_type, return_label);
+            }
+            tir::Stmt::Expression { expr, .. } => {
+                let value = self.lower_expr(&expr);
+                self.free(&value);
+            }
+        }
+    }
+
+    fn lower_compound_stmt(
+        &mut self,
+        compound: tir::CompoundStmt,
+        return_type: &Type,
+        return_label: LabelId,
+    ) {
+        for item in compound.items {
+            match item {
+                tir::BlockItem::Declaration(decl) => {
+                    self.lower_local_declaration(&decl);
+                }
+                tir::BlockItem::Statement(stmt) => {
+                    self.lower_stmt(stmt, return_type, return_label.clone());
+                }
+            }
+        }
+    }
+
+    fn lower_local_declaration(&mut self, declaration: &tir::Declaration) {
+        for declarator in &declaration.declarators {
+            let typ = declarator.qtype.typ.clone();
+
+            let slot = self.stack_slot(typ.clone());
+
+            self.locals.insert(declarator.symbol_id, slot.clone());
+
+            if let Some(initializer) = &declarator.initializer {
+                let value = self.lower_initializer(initializer);
+
+                let value = match value {
+                    Operand::Stack(_) | Operand::Global(_) => self.make_temp(value),
+
+                    value => value,
+                };
+
+                self.write_lir(Lir::Mov {
+                    dst: slot,
+                    src: value.clone(),
+                });
+
+                self.free(&value);
+            }
+        }
+    }
+
+    fn lower_return(
+        &mut self,
+        expr: Option<&tir::Expr>,
+        return_type: &Type,
+        return_label: LabelId,
+    ) {
+        if let Some(expr) = expr {
+            let value = self.lower_expr(expr);
+
+            let return_reg = Operand::Physical {
+                reg: PhysicalReg::Rax,
+                typ: return_type.clone(),
+            };
+
+            self.write_lir(Lir::Mov {
+                src: value.clone(),
+                dst: return_reg,
+            });
+
+            self.free(&value);
+        }
+
+        self.write_lir(Lir::Jmp(return_label));
+    }
+
+    fn lower_initializer(&mut self, initializer: &tir::Initializer) -> Operand {
+        match initializer {
+            tir::Initializer::Expr(expr) => self.lower_expr(expr),
+        }
+    }
+
+    pub fn lower_expr(&mut self, expr: &tir::Expr) -> Operand {
+        match &expr.kind {
+            tir::ExprKind::Literal(lit) => match lit {
+                tir::LiteralKind::Int(int_lit) => Operand::Immediate {
+                    value: ImmediateValue::Int(*int_lit),
+                    typ: expr.qtype.typ.clone(),
+                },
+                tir::LiteralKind::Float(float_lit) => Operand::Immediate {
+                    value: ImmediateValue::Float(*float_lit),
+                    typ: expr.qtype.typ.clone(),
+                },
+                tir::LiteralKind::Double(double_lit) => Operand::Immediate {
+                    value: ImmediateValue::Double(*double_lit),
+                    typ: expr.qtype.typ.clone(),
+                },
+                tir::LiteralKind::Char(char_lit) => Operand::Immediate {
+                    value: ImmediateValue::Char(*char_lit),
+                    typ: expr.qtype.typ.clone(),
+                },
+            },
+
+            tir::ExprKind::Symbol(symbol_id) => self.get_var(symbol_id),
+
+            tir::ExprKind::Binary { lhs, op, rhs } => {
+                let left = self.lower_expr(lhs);
+                let right = self.lower_expr(rhs);
+
+                match op {
+                    tir::BinaryOp::Add => self.lower_add(left, right, expr.qtype.typ.clone()),
+                    tir::BinaryOp::Sub => self.lower_sub(left, right, expr.qtype.typ.clone()),
+                    tir::BinaryOp::Mul => self.lower_mul(left, right, expr.qtype.typ.clone()),
+                    tir::BinaryOp::Div => self.lower_div(left, right, expr.qtype.typ.clone(), true),
+
+                    _ => todo!("binary operator {op:?}"),
+                }
+            }
+
+            tir::ExprKind::Assignment { lhs, rhs } => {
+                let destination = self.lower_lvalue(lhs);
+                let value = self.lower_expr(rhs);
+
+                let value = match value {
+                    Operand::Stack(_) | Operand::Global(_) => self.make_temp(value),
+                    other => other,
+                };
+
+                self.write_lir(Lir::Mov {
+                    dst: destination.clone(),
+                    src: value.clone(),
+                });
+
+                self.free(&value);
+
+                destination
+            }
+
+            tir::ExprKind::Cast {
+                new_type,
+                expr: inner,
+            } => self.lower_cast(inner, new_type.typ.clone()),
+
+            _ => todo!("expression lowering for {:?}", expr.kind),
+        }
+    }
+
+    fn lower_lvalue(&mut self, expr: &tir::Expr) -> Operand {
+        match &expr.kind {
+            tir::ExprKind::Symbol(symbol_id) => self.get_var(symbol_id),
+
+            _ => todo!("lvalue lowering for {:?}", expr.kind),
+        }
+    }
+
+    fn lower_add(&mut self, left: Operand, right: Operand, typ: Type) -> Operand {
+        let result = self.temp(typ);
+
+        self.write_lir(Lir::Mov {
+            dst: result.clone(),
+            src: left.clone(),
+        });
+
+        self.write_lir(Lir::Add {
+            dst: result.clone(),
+            src: right.clone(),
+        });
+
+        self.free(&left);
+        self.free(&right);
+
+        result
+    }
+
+    fn lower_sub(&mut self, left: Operand, right: Operand, typ: Type) -> Operand {
+        let result = self.temp(typ);
+
+        self.write_lir(Lir::Mov {
+            dst: result.clone(),
+            src: left.clone(),
+        });
+
+        self.write_lir(Lir::Sub {
+            dst: result.clone(),
+            src: right.clone(),
+        });
+
+        self.free(&left);
+        self.free(&right);
+
+        result
+    }
+
+    fn lower_mul(&mut self, left: Operand, right: Operand, typ: Type) -> Operand {
+        let result = self.temp(typ);
+
+        self.write_lir(Lir::Mov {
+            dst: result.clone(),
+            src: left.clone(),
+        });
+
+        self.write_lir(Lir::Mul {
+            dst: result.clone(),
+            src: right.clone(),
+        });
+
+        self.free(&left);
+        self.free(&right);
+
+        result
+    }
+
+    fn lower_div(&mut self, left: Operand, right: Operand, typ: Type, signed: bool) -> Operand {
+        let divisor = self.make_temp(right);
+
+        let rax = Operand::Physical {
+            reg: PhysicalReg::Rax,
+            typ: typ.clone(),
+        };
+
+        self.write_lir(Lir::Mov {
+            dst: rax.clone(),
+            src: left.clone(),
+        });
+
+        self.write_lir(Lir::Div {
+            divisor: divisor.clone(),
+            typ: typ.clone(),
+            signed,
+        });
+
+        let result = self.temp(typ.clone());
+
+        self.write_lir(Lir::Mov {
+            dst: result.clone(),
+            src: rax,
+        });
+
+        self.free(&left);
+        self.free(&divisor);
+
+        result
+    }
+
+    fn lower_cast(&mut self, expr: &tir::Expr, new_type: Type) -> Operand {
+        let src = self.lower_expr(expr);
+
+        let Some(old_type) = src.typ().cloned() else {
+            return Operand::Void;
+        };
+
+        if old_type == new_type {
+            return src;
+        }
+
+        let kind = cast_kind(&old_type, &new_type);
+        let dst = self.temp(new_type);
+
+        self.write_lir(Lir::Cast {
+            kind,
+            dst: dst.clone(),
+            src: src.clone(),
+        });
+
+        self.free(&src);
+
+        dst
+    }
+}
+
+fn cast_kind(old: &Type, new: &Type) -> CastKind {
+    match (old, new) {
+        (Type::Primitive(Primitive::Int), Type::Primitive(Primitive::Float)) => {
+            CastKind::IntToFloat
+        }
+        (Type::Primitive(Primitive::Int), Type::Primitive(Primitive::Double)) => {
+            CastKind::IntToDouble
+        }
+        (Type::Primitive(Primitive::Float), Type::Primitive(Primitive::Int)) => {
+            CastKind::FloatToInt
+        }
+        (Type::Primitive(Primitive::Double), Type::Primitive(Primitive::Int)) => {
+            CastKind::DoubleToInt
+        }
+        (Type::Primitive(Primitive::Float), Type::Primitive(Primitive::Double)) => {
+            CastKind::FloatToDouble
+        }
+        (Type::Primitive(Primitive::Double), Type::Primitive(Primitive::Float)) => {
+            CastKind::DoubleToFloat
+        }
+
+        _ if old.size() < new.size() => CastKind::SignExtend,
+        _ if old.size() > new.size() => CastKind::Truncate,
+        _ => CastKind::ZeroExtend,
     }
 }

@@ -76,7 +76,7 @@ fn main() {
         }
     };
 
-    let assembly = codegen::Codegen::new().generate(&tir);
+    let assembly = codegen::Codegen::new(tir).generate();
     let assembly_path = std::path::Path::new(&filename).with_extension("s");
     let executable_path = std::path::Path::new(&filename).with_extension("");
 
@@ -104,7 +104,7 @@ fn main() {
 
     match result {
         Ok(status) if status.success() => {
-            let _ = std::fs::remove_file(&assembly_path);
+            // let _ = std::fs::remove_file(&assembly_path);
         }
 
         Ok(status) => {

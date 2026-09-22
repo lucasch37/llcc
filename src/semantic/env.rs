@@ -19,8 +19,34 @@ pub struct Symbol {
     pub kind: InitType,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SymbolTable {
+    symbols: Vec<Symbol>,
+}
+
+impl SymbolTable {
+    pub fn insert(&mut self, name: String, qtype: QualType, kind: InitType) -> SymbolId {
+        let id = SymbolId(self.symbols.len());
+        self.symbols.push(Symbol {
+            id,
+            name,
+            qtype,
+            kind,
+        });
+        id
+    }
+
+    pub fn get(&self, id: SymbolId) -> Option<&Symbol> {
+        self.symbols.get(id.0)
+    }
+
+    pub fn get_mut(&mut self, id: SymbolId) -> Option<&mut Symbol> {
+        self.symbols.get_mut(id.0)
+    }
+}
+
 pub struct Scope {
-    symbols: HashMap<String, Symbol>,
+    symbols: HashMap<String, SymbolId>,
 }
 
 impl Scope {
@@ -33,7 +59,7 @@ impl Scope {
 
 pub struct ScopeTree {
     scopes: Vec<Scope>,
-    next_symbol_id: usize,
+    symbols: SymbolTable,
 }
 
 impl ScopeTree {
@@ -41,7 +67,7 @@ impl ScopeTree {
         // initialize with a global scope
         Self {
             scopes: vec![Scope::new()],
-            next_symbol_id: 0,
+            symbols: SymbolTable::default(),
         }
     }
 
@@ -57,47 +83,58 @@ impl ScopeTree {
         self.scopes.pop();
     }
 
-    pub fn lookup(&self, name: &str) -> Option<&Symbol> {
+    pub fn lookup(&self, name: &str) -> Option<SymbolId> {
         for scope in self.scopes.iter().rev() {
-            if let Some(symbol) = scope.symbols.get(name) {
-                return Some(symbol);
+            if let Some(id) = scope.symbols.get(name) {
+                return Some(*id);
             }
         }
         None
     }
 
-    pub fn lookup_local(&self, name: &str) -> Option<&Symbol> {
+    pub fn lookup_local(&self, name: &str) -> Option<SymbolId> {
         if let Some(scope) = self.scopes.last() {
-            return scope.symbols.get(name);
+            return scope.symbols.get(name).copied();
         }
         None
     }
 
-    pub fn new_symbol(&mut self, name: String, qtype: QualType, kind: InitType) -> Symbol {
-        let id = SymbolId(self.next_symbol_id);
-        self.next_symbol_id += 1;
-
-        Symbol {
-            id,
-            name,
-            qtype,
-            kind,
-        }
+    pub fn symbol(&self, id: SymbolId) -> &Symbol {
+        self.symbols.get(id).expect("unknown symbol id")
     }
 
-    pub fn define(&mut self, name: String, symbol: Symbol) {
+    pub fn symbol_mut(&mut self, id: SymbolId) -> &mut Symbol {
+        self.symbols.get_mut(id).expect("unknown symbol id")
+    }
+
+    pub fn symbols(&self) -> &SymbolTable {
+        &self.symbols
+    }
+
+    pub fn new_symbol(&mut self, name: String, qtype: QualType, kind: InitType) -> SymbolId {
+        self.symbols.insert(name, qtype, kind)
+    }
+
+    pub fn define(&mut self, name: String, id: SymbolId) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.symbols.insert(name, symbol);
+            scope.symbols.insert(name, id);
         }
     }
 
-    pub fn check_redefinition(&self, new: &Symbol, existing: &Symbol) -> bool {
-        if !new.qtype.type_compatible(&existing.qtype) {
+    pub fn check_redefinition(
+        &self,
+        qtype: &QualType,
+        kind: &InitType,
+        existing: SymbolId,
+    ) -> bool {
+        let existing = self.symbol(existing);
+
+        if !qtype.type_compatible(&existing.qtype) {
             return true;
         }
 
         matches!(
-            (&new.kind, &existing.kind),
+            (kind, &existing.kind),
             (InitType::Definition, InitType::Definition)
         )
     }
