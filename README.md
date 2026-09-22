@@ -37,7 +37,6 @@ int main() {
   </td>
   <td>
     <img width="486" height="233" alt="image" src="https://github.com/user-attachments/assets/2f3e22ff-0e57-432b-951b-8cdfa1d94e98" />
-">
   </td>
 </tr>
 </table>
@@ -62,7 +61,6 @@ int main() {
   </td>
   <td>
     <img width="428" height="765" alt="image" src="https://github.com/user-attachments/assets/93ee6c84-5b47-460b-a72e-abffa573cd83" />
-">
   </td>
 </tr>
 </table>
